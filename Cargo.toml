@@ -1,0 +1,8 @@
+[package]
+name = "s9_parquet"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+parquet = "56.2"
+#arrow = "56.2"
