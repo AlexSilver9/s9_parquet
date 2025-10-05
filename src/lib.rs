@@ -3,7 +3,7 @@ use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use parquet::schema::types::Type;
 
@@ -31,14 +31,17 @@ pub struct Entry {
 
 pub struct ParquetWriter {
     pub writer: SerializedFileWriter<File>,
+    pub file_path: PathBuf,
 }
 
 impl ParquetWriter {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
+        let path_buf = PathBuf::from(path.as_ref());
         let schema = Arc::new(parse_message_type(MESSAGE_SCHEMA)?);
-        let file = File::create(path)?;
+        let file = File::create(path_buf.as_path())?;
         let writer = SerializedFileWriter::new(file, schema, Default::default())?;
-        let parquet_writer = ParquetWriter { writer };
+
+        let parquet_writer = ParquetWriter { writer, file_path: path_buf };
         Ok(parquet_writer)
     }
 
@@ -90,14 +93,16 @@ impl ParquetWriter {
 pub struct ParquetReader {
     pub reader: SerializedFileReader<File>,
     pub schema: Type,
+    pub file_path: PathBuf,
 }
 
 impl ParquetReader {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
+        let path_buf = PathBuf::from(path.as_ref());
         let schema = parse_message_type(MESSAGE_SCHEMA)?;
         let file = File::open(path)?;
         let reader = SerializedFileReader::new(file)?;
-        let parquet_reader = ParquetReader { reader, schema };
+        let parquet_reader = ParquetReader { reader, schema, file_path: path_buf };
         Ok(parquet_reader)
     }
 
