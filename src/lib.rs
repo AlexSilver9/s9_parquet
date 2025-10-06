@@ -42,7 +42,7 @@ impl ParquetWriter {
         let schema = Arc::new(parse_message_type(MESSAGE_SCHEMA)?);
         let file = File::create(path_buf.as_path())?;
 
-        let zstd_level = ZstdLevel::try_new(10)?;
+        let zstd_level = ZstdLevel::try_new(5)?;
         let props = WriterProperties::builder()
             .set_compression(Compression::ZSTD(zstd_level))
             .build();
