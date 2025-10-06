@@ -6,6 +6,8 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use parquet::schema::types::Type;
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::properties::{WriterProperties, WriterPropertiesPtr};
 
 const MESSAGE_SCHEMA: &str = "\
   message schema {
@@ -39,7 +41,14 @@ impl ParquetWriter {
         let path_buf = PathBuf::from(path.as_ref());
         let schema = Arc::new(parse_message_type(MESSAGE_SCHEMA)?);
         let file = File::create(path_buf.as_path())?;
-        let writer = SerializedFileWriter::new(file, schema, Default::default())?;
+
+        let zstd_level = ZstdLevel::try_new(22)?;
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(zstd_level))
+            .build();
+        let props_ptr = WriterPropertiesPtr::new(props);
+
+        let writer = SerializedFileWriter::new(file, schema, props_ptr)?;
 
         let parquet_writer = ParquetWriter { writer, file_path: path_buf };
         Ok(parquet_writer)
