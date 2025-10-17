@@ -1,13 +1,19 @@
+use arrow::array::AsArray;
+use futures::TryStreamExt;
+use parquet::arrow::async_reader::ParquetRecordBatchStream;
+use parquet::arrow::ParquetRecordBatchStreamBuilder;
+use parquet::basic::{Compression, ZstdLevel};
 use parquet::data_type::AsBytes;
+use parquet::file::metadata::ParquetMetaData;
+use parquet::file::properties::{WriterProperties, WriterPropertiesPtr};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
+use parquet::schema::types::Type;
 use std::fs::File;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use parquet::schema::types::Type;
-use parquet::basic::{Compression, ZstdLevel};
-use parquet::file::properties::{WriterProperties, WriterPropertiesPtr};
 
 const MESSAGE_SCHEMA: &str = "\
   message schema {
@@ -37,7 +43,7 @@ pub struct ParquetWriter {
 }
 
 impl ParquetWriter {
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new<P: AsRef<Path>>(path: P) -> anyhow::Result<Self, Box<dyn std::error::Error>> {
         let path_buf = PathBuf::from(path.as_ref());
         let schema = Arc::new(parse_message_type(MESSAGE_SCHEMA)?);
         let file = File::create(path_buf.as_path())?;
@@ -57,7 +63,7 @@ impl ParquetWriter {
     pub fn write(
         &mut self,
         entry: &Entry,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> anyhow::Result<(), Box<dyn std::error::Error>> {
         let mut row_group_writer = self.writer.next_row_group()?;
 
         // Write timestamp_millis column
@@ -99,23 +105,23 @@ impl ParquetWriter {
     }
 }
 
-pub struct ParquetReader {
+pub struct SyncParquetReader {
     pub reader: SerializedFileReader<File>,
     pub schema: Type,
     pub file_path: PathBuf,
 }
 
-impl ParquetReader {
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
+impl SyncParquetReader {
+    pub fn new<P: AsRef<Path>>(path: P) -> anyhow::Result<Self, Box<dyn std::error::Error>> {
         let path_buf = PathBuf::from(path.as_ref());
         let schema = parse_message_type(MESSAGE_SCHEMA)?;
         let file = File::open(path)?;
         let reader = SerializedFileReader::new(file)?;
-        let parquet_reader = ParquetReader { reader, schema, file_path: path_buf };
+        let parquet_reader = SyncParquetReader { reader, schema, file_path: path_buf };
         Ok(parquet_reader)
     }
 
-    pub fn read(&self) -> Result<Vec<Entry>, Box<dyn std::error::Error>> {
+    pub fn read(&self) -> anyhow::Result<Vec<Entry>, Box<dyn std::error::Error>> {
         let mut entries: Vec<Entry> = Vec::new();
 
         let row_iter = self.reader.get_row_iter(Some(self.schema.clone()));
@@ -178,6 +184,70 @@ impl ParquetReader {
     }
 }
 
+pub struct AsyncParquetReader {
+    pub metadata: ParquetMetaData,
+    pub stream: ParquetRecordBatchStream<tokio::fs::File>,
+    pub file_path: PathBuf,
+}
+
+impl AsyncParquetReader {
+    pub async fn new<P: AsRef<Path>>(path: P, batch_size: usize) -> anyhow::Result<Self, Box<dyn std::error::Error>> {
+        let path_buf = PathBuf::from(path.as_ref());
+        let file = tokio::fs::File::open(path).await?;
+        let builder = ParquetRecordBatchStreamBuilder::new(file)
+            .await?
+            .with_batch_size(batch_size);
+
+        let meta = builder.metadata().clone();
+
+        let stream = builder.build()?;
+        Ok(AsyncParquetReader {
+            metadata: meta.deref().clone(),
+            stream,
+            file_path: path_buf,
+        })
+    }
+
+    pub async fn read(self) -> anyhow::Result<Vec<Entry>, Box<dyn std::error::Error>> {
+        let results = self.stream.try_collect::<Vec<_>>().await?;
+        let mut entries: Vec<Entry> = Vec::new();
+
+        for batch in results {
+            let num_rows = batch.num_rows();
+
+            let timestamp_millis_array = batch.column(0).as_primitive::<arrow::datatypes::Int64Type>();
+            let timestamp_sec_array = batch.column(1).as_primitive::<arrow::datatypes::Int64Type>();
+            let timestamp_sub_sec_array = batch.column(2).as_primitive::<arrow::datatypes::Int32Type>();
+            let data_array = batch.column(3).as_binary::<i32>();
+
+            for i in 0..num_rows {
+                let timestamp_info = TimestampInfo {
+                    timestamp_millis: timestamp_millis_array.value(i),
+                    timestamp_sec: timestamp_sec_array.value(i),
+                    timestamp_sub_sec: timestamp_sub_sec_array.value(i),
+                };
+                let data = data_array.value(i).to_vec();
+                let entry = Entry {
+                    timestamp_info,
+                    data,
+                };
+                entries.push(entry);
+            }
+        }
+
+        Ok(entries)
+    }
+
+    pub fn print_metadata(&self) {
+        let metadata = &self.metadata;
+        println!(
+            "Parquet file has {} rows",
+            metadata.file_metadata().num_rows()
+        );
+        println!("Schema: {:?}", metadata.file_metadata().schema());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parquet_operations() {
+    fn test_sync_parquet_operations() {
         let test_file_path = "target/test.parquet";
         let test_timestamp_info = get_timestamp_info().unwrap();
         let test_string: String = String::from("Hello, Parquet!");
@@ -209,13 +279,15 @@ mod tests {
         };
         let test_entries: Vec<Entry> = vec![test_entry.clone()];
 
+        // Write the test data first
         let mut parquet_writer = ParquetWriter::new(test_file_path).unwrap();
         parquet_writer
             .write(&test_entry)
             .unwrap();
         parquet_writer.close().unwrap();
 
-        let parquet_reader = ParquetReader::new(test_file_path).unwrap();
+        // Test sync reading
+        let parquet_reader = SyncParquetReader::new(test_file_path).unwrap();
         let read_entries: Vec<Entry> = parquet_reader.read().unwrap();
 
         assert_eq!(test_entries, read_entries);
@@ -229,5 +301,36 @@ mod tests {
         );
 
         parquet_reader.print_metadata();
+    }
+
+    #[tokio::test]
+    async fn test_async_parquet_operations() {
+        let test_file_path = "target/test_async.parquet";
+        let test_timestamp_info = get_timestamp_info().unwrap();
+        let test_string: String = String::from("Hello, Async Parquet!");
+        let test_entry = Entry {
+            timestamp_info: test_timestamp_info.clone(),
+            data: test_string.clone().as_bytes().to_vec(),
+        };
+        let test_entries: Vec<Entry> = vec![test_entry.clone()];
+
+        // Write the test data first
+        let mut parquet_writer = ParquetWriter::new(test_file_path).unwrap();
+        parquet_writer.write(&test_entry).unwrap();
+        parquet_writer.close().unwrap();
+
+        // Test async reading
+        let parquet_reader = AsyncParquetReader::new(test_file_path, 1024).await.unwrap();
+        let read_entries: Vec<Entry> = parquet_reader.read().await.unwrap();
+
+        assert_eq!(test_entries, read_entries);
+        assert_eq!(
+            test_entries.iter().nth(0).unwrap().timestamp_info,
+            read_entries.iter().nth(0).unwrap().timestamp_info
+        );
+        assert_eq!(
+            test_entries.iter().nth(0).unwrap().data,
+            read_entries.iter().nth(0).unwrap().data
+        );
     }
 }
