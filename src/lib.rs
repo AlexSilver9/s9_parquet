@@ -43,7 +43,7 @@ pub struct ParquetWriter {
 }
 
 impl ParquetWriter {
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new<P: AsRef<Path>>(path: P) -> anyhow::Result<Self, Box<dyn std::error::Error>> {
         let path_buf = PathBuf::from(path.as_ref());
         let schema = Arc::new(parse_message_type(MESSAGE_SCHEMA)?);
         let file = File::create(path_buf.as_path())?;
@@ -63,7 +63,7 @@ impl ParquetWriter {
     pub fn write(
         &mut self,
         entry: &Entry,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> anyhow::Result<(), Box<dyn std::error::Error>> {
         let mut row_group_writer = self.writer.next_row_group()?;
 
         // Write timestamp_millis column
@@ -112,7 +112,7 @@ pub struct SyncParquetReader {
 }
 
 impl SyncParquetReader {
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new<P: AsRef<Path>>(path: P) -> anyhow::Result<Self, Box<dyn std::error::Error>> {
         let path_buf = PathBuf::from(path.as_ref());
         let schema = parse_message_type(MESSAGE_SCHEMA)?;
         let file = File::open(path)?;
@@ -121,7 +121,7 @@ impl SyncParquetReader {
         Ok(parquet_reader)
     }
 
-    pub fn read(&self) -> Result<Vec<Entry>, Box<dyn std::error::Error>> {
+    pub fn read(&self) -> anyhow::Result<Vec<Entry>, Box<dyn std::error::Error>> {
         let mut entries: Vec<Entry> = Vec::new();
 
         let row_iter = self.reader.get_row_iter(Some(self.schema.clone()));
@@ -191,7 +191,7 @@ pub struct AsyncParquetReader {
 }
 
 impl AsyncParquetReader {
-    pub async fn new<P: AsRef<Path>>(path: P, batch_size: usize) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new<P: AsRef<Path>>(path: P, batch_size: usize) -> anyhow::Result<Self, Box<dyn std::error::Error>> {
         let path_buf = PathBuf::from(path.as_ref());
         let file = tokio::fs::File::open(path).await?;
         let builder = ParquetRecordBatchStreamBuilder::new(file)
@@ -208,7 +208,7 @@ impl AsyncParquetReader {
         })
     }
 
-    pub async fn read(self) -> Result<Vec<Entry>, Box<dyn std::error::Error>> {
+    pub async fn read(self) -> anyhow::Result<Vec<Entry>, Box<dyn std::error::Error>> {
         let results = self.stream.try_collect::<Vec<_>>().await?;
         let mut entries: Vec<Entry> = Vec::new();
 
