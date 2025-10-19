@@ -239,7 +239,7 @@ impl AsyncParquetReader {
         Ok(entries)
     }
 
-    pub fn into_entry_stream(self) -> impl futures::Stream<Item = Result<Entry, Box<dyn std::error::Error + Send + Sync>>> {
+    pub fn into_entry_stream(self) -> impl futures::Stream<Item = anyhow::Result<Entry, Box<dyn std::error::Error + Send + Sync>>> {
         self.stream.map(move |batch_result| {
             match batch_result {
                 Ok(batch) => {
@@ -261,14 +261,14 @@ impl AsyncParquetReader {
                             timestamp_info,
                             data,
                         };
-                        results.push(Ok(entry) as Result<Entry, Box<dyn std::error::Error + Send + Sync>>);
+                        results.push(Ok(entry));
                     }
 
                     futures::stream::iter(results)
                 }
                 Err(e) => {
                     let error: Box<dyn std::error::Error + Send + Sync> = Box::new(e);
-                    let result = vec![Err(error) as Result<Entry, Box<dyn std::error::Error + Send + Sync>>];
+                    let result = vec![Err(error)];
                     futures::stream::iter(result)
                 }
             }
