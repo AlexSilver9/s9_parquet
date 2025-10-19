@@ -1,19 +1,20 @@
-use arrow::array::AsArray;
-use futures::TryStreamExt;
-use parquet::arrow::async_reader::ParquetRecordBatchStream;
-use parquet::arrow::ParquetRecordBatchStreamBuilder;
-use parquet::basic::{Compression, ZstdLevel};
 use parquet::data_type::AsBytes;
-use parquet::file::metadata::ParquetMetaData;
-use parquet::file::properties::{WriterProperties, WriterPropertiesPtr};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
-use parquet::schema::types::Type;
 use std::fs::File;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use arrow::array::AsArray;
+use futures::StreamExt;
+use futures::TryStreamExt;
+use parquet::arrow::async_reader::ParquetRecordBatchStream;
+use parquet::arrow::ParquetRecordBatchStreamBuilder;
+use parquet::schema::types::Type;
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::metadata::{ParquetMetaData};
+use parquet::file::properties::{WriterProperties, WriterPropertiesPtr};
 
 const MESSAGE_SCHEMA: &str = "\
   message schema {
@@ -106,7 +107,7 @@ impl ParquetWriter {
 }
 
 pub struct SyncParquetReader {
-    pub reader: SerializedFileReader<File>,
+    reader: SerializedFileReader<File>,
     pub schema: Type,
     pub file_path: PathBuf,
 }
@@ -185,8 +186,8 @@ impl SyncParquetReader {
 }
 
 pub struct AsyncParquetReader {
+    stream: ParquetRecordBatchStream<tokio::fs::File>,
     pub metadata: ParquetMetaData,
-    pub stream: ParquetRecordBatchStream<tokio::fs::File>,
     pub file_path: PathBuf,
 }
 
@@ -236,6 +237,42 @@ impl AsyncParquetReader {
         }
 
         Ok(entries)
+    }
+
+    pub fn into_entry_stream(self) -> impl futures::Stream<Item = Result<Entry, Box<dyn std::error::Error + Send + Sync>>> {
+        self.stream.map(move |batch_result| {
+            match batch_result {
+                Ok(batch) => {
+                    let num_rows = batch.num_rows();
+                    let timestamp_millis_array = batch.column(0).as_primitive::<arrow::datatypes::Int64Type>();
+                    let timestamp_sec_array = batch.column(1).as_primitive::<arrow::datatypes::Int64Type>();
+                    let timestamp_sub_sec_array = batch.column(2).as_primitive::<arrow::datatypes::Int32Type>();
+                    let data_array = batch.column(3).as_binary::<i32>();
+
+                    let mut results = Vec::with_capacity(num_rows);
+                    for i in 0..num_rows {
+                        let timestamp_info = TimestampInfo {
+                            timestamp_millis: timestamp_millis_array.value(i),
+                            timestamp_sec: timestamp_sec_array.value(i),
+                            timestamp_sub_sec: timestamp_sub_sec_array.value(i),
+                        };
+                        let data = data_array.value(i).to_vec();
+                        let entry = Entry {
+                            timestamp_info,
+                            data,
+                        };
+                        results.push(Ok(entry) as Result<Entry, Box<dyn std::error::Error + Send + Sync>>);
+                    }
+
+                    futures::stream::iter(results)
+                }
+                Err(e) => {
+                    let error: Box<dyn std::error::Error + Send + Sync> = Box::new(e);
+                    let result = vec![Err(error) as Result<Entry, Box<dyn std::error::Error + Send + Sync>>];
+                    futures::stream::iter(result)
+                }
+            }
+        }).flatten()
     }
 
     pub fn print_metadata(&self) {
@@ -332,5 +369,77 @@ mod tests {
             test_entries.iter().nth(0).unwrap().data,
             read_entries.iter().nth(0).unwrap().data
         );
+    }
+
+    #[tokio::test]
+    async fn test_async_stream_operations() {
+        let test_file_path = "target/test_stream.parquet";
+        let test_timestamp_info = get_timestamp_info().unwrap();
+        let test_string: String = String::from("Hello, Stream Parquet!");
+        let test_entry = Entry {
+            timestamp_info: test_timestamp_info.clone(),
+            data: test_string.clone().as_bytes().to_vec(),
+        };
+
+        // Write the test data first
+        let mut parquet_writer = ParquetWriter::new(test_file_path).unwrap();
+        parquet_writer.write(&test_entry).unwrap();
+        parquet_writer.close().unwrap();
+
+        // Test async streaming
+        let async_reader = AsyncParquetReader::new(test_file_path, 1024).await.unwrap();
+        let mut stream = async_reader.into_entry_stream();
+
+        let mut entries = Vec::new();
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(entry) => entries.push(entry),
+                Err(e) => panic!("Stream error: {}", e),
+            }
+        }
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].timestamp_info, test_timestamp_info);
+        assert_eq!(entries[0].data, test_string.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_async_stream_multiple_entries() {
+        let test_file_path = "target/test_stream_multiple.parquet";
+        let test_entries = vec![
+            Entry {
+                timestamp_info: get_timestamp_info().unwrap(),
+                data: "Entry 1".as_bytes().to_vec(),
+            },
+            Entry {
+                timestamp_info: get_timestamp_info().unwrap(),
+                data: "Entry 2".as_bytes().to_vec(),
+            },
+            Entry {
+                timestamp_info: get_timestamp_info().unwrap(),
+                data: "Entry 3".as_bytes().to_vec(),
+            },
+        ];
+
+        // Write multiple entries
+        let mut parquet_writer = ParquetWriter::new(test_file_path).unwrap();
+        for entry in &test_entries {
+            parquet_writer.write(entry).unwrap();
+        }
+        parquet_writer.close().unwrap();
+
+        // Test streaming multiple entries
+        let async_reader = AsyncParquetReader::new(test_file_path, 1024).await.unwrap();
+        let stream = async_reader.into_entry_stream();
+
+        let streamed_entries: Vec<Entry> = stream
+            .map(|result| result.unwrap())
+            .collect()
+            .await;
+
+        assert_eq!(streamed_entries.len(), test_entries.len());
+        for (i, entry) in streamed_entries.iter().enumerate() {
+            assert_eq!(entry.data, test_entries[i].data);
+        }
     }
 }
