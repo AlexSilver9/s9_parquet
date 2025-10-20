@@ -1,6 +1,6 @@
 use parquet::data_type::AsBytes;
 use parquet::file::reader::{FileReader, SerializedFileReader};
-use parquet::file::writer::SerializedFileWriter;
+use parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 use parquet::schema::parser::parse_message_type;
 use std::fs::File;
 use std::ops::Deref;
@@ -33,7 +33,7 @@ pub struct TimestampInfo {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Entry {
+pub struct Record {
     pub timestamp_info: TimestampInfo,
     pub data: Vec<u8>,
 }
@@ -41,66 +41,104 @@ pub struct Entry {
 pub struct ParquetWriter {
     pub writer: SerializedFileWriter<File>,
     pub file_path: PathBuf,
+    current_row_group: Option<SerializedRowGroupWriter<'static, File>>,
+    rows_in_current_group: usize,
+    max_rows_per_group: usize,
 }
 
+// TOOD: Handle max limits like this:
+// Err: Parquet does not support more than 32767 row groups per file (currently: 32768)
+
 impl ParquetWriter {
-    pub fn new<P: AsRef<Path>>(path: P) -> anyhow::Result<Self, Box<dyn std::error::Error>> {
+    pub fn new<P: AsRef<Path>>(path: P, max_records_per_group: usize) -> anyhow::Result<Self, Box<dyn std::error::Error>> {
         let path_buf = PathBuf::from(path.as_ref());
         let schema = Arc::new(parse_message_type(MESSAGE_SCHEMA)?);
         let file = File::create(path_buf.as_path())?;
 
+        // TODO: Make other conpressions available through configuration
         let zstd_level = ZstdLevel::try_new(5)?;
         let props = WriterProperties::builder()
             .set_compression(Compression::ZSTD(zstd_level))
+            .set_max_row_group_size(max_records_per_group) // TODO: Make struct with max value check
             .build();
         let props_ptr = WriterPropertiesPtr::new(props);
 
         let writer = SerializedFileWriter::new(file, schema, props_ptr)?;
 
-        let parquet_writer = ParquetWriter { writer, file_path: path_buf };
+        let parquet_writer = ParquetWriter {
+            writer,
+            file_path: path_buf,
+            current_row_group: None,
+            rows_in_current_group: 0,
+            max_rows_per_group: max_records_per_group,
+        };
         Ok(parquet_writer)
     }
 
     pub fn write(
         &mut self,
-        entry: &Entry,
+        record: &Record,
     ) -> anyhow::Result<(), Box<dyn std::error::Error>> {
-        let mut row_group_writer = self.writer.next_row_group()?;
 
-        // Write timestamp_millis column
-        if let Some(mut col_writer) = row_group_writer.next_column()? {
-            let typed_col_writer = col_writer.typed::<parquet::data_type::Int64Type>();
-            typed_col_writer.write_batch(&[entry.timestamp_info.timestamp_millis], None, None)?;
-            col_writer.close()?;
+        // Start a new row group if needed
+        if self.current_row_group.is_none() || self.rows_in_current_group >= self.max_rows_per_group {
+            self.finish_current_row_group()?;
+            self.start_new_row_group()?;
         }
 
-        // Write timestamp_sec column
-        if let Some(mut col_writer) = row_group_writer.next_column()? {
-            let typed_col_writer = col_writer.typed::<parquet::data_type::Int64Type>();
-            typed_col_writer.write_batch(&[entry.timestamp_info.timestamp_sec], None, None)?;
-            col_writer.close()?;
-        }
+        // Write to current row group
+        if let Some(ref mut row_group_writer) = self.current_row_group {
+            // Write timestamp_millis column
+            if let Some(mut col_writer) = row_group_writer.next_column()? {
+                let typed_col_writer = col_writer.typed::<parquet::data_type::Int64Type>();
+                typed_col_writer.write_batch(&[record.timestamp_info.timestamp_millis], None, None)?;
+                col_writer.close()?;
+            }
 
-        // Write timestamp_sub_sec column
-        if let Some(mut col_writer) = row_group_writer.next_column()? {
-            let typed_col_writer = col_writer.typed::<parquet::data_type::Int32Type>();
-            typed_col_writer.write_batch(&[entry.timestamp_info.timestamp_sub_sec], None, None)?;
-            col_writer.close()?;
-        }
+            // Write timestamp_sec column
+            if let Some(mut col_writer) = row_group_writer.next_column()? {
+                let typed_col_writer = col_writer.typed::<parquet::data_type::Int64Type>();
+                typed_col_writer.write_batch(&[record.timestamp_info.timestamp_sec], None, None)?;
+                col_writer.close()?;
+            }
 
-        // Write data column
-        if let Some(mut col_writer) = row_group_writer.next_column()? {
-            let typed_col_writer = col_writer.typed::<parquet::data_type::ByteArrayType>();
-            let byte_array = parquet::data_type::ByteArray::from(entry.data.to_vec());
-            typed_col_writer.write_batch(&[byte_array], None, None)?;
-            col_writer.close()?;
-        }
+            // Write timestamp_sub_sec column
+            if let Some(mut col_writer) = row_group_writer.next_column()? {
+                let typed_col_writer = col_writer.typed::<parquet::data_type::Int32Type>();
+                typed_col_writer.write_batch(&[record.timestamp_info.timestamp_sub_sec], None, None)?;
+                col_writer.close()?;
+            }
 
-        row_group_writer.close()?;
+            // Write data column
+            if let Some(mut col_writer) = row_group_writer.next_column()? {
+                let typed_col_writer = col_writer.typed::<parquet::data_type::ByteArrayType>();
+                let byte_array = parquet::data_type::ByteArray::from(record.data.to_vec());
+                typed_col_writer.write_batch(&[byte_array], None, None)?;
+                col_writer.close()?;
+            }
+
+            self.rows_in_current_group += 1;
+        }
         Ok(())
     }
 
-    pub fn close(self) -> Result<(), Box<dyn std::error::Error>> {
+    fn start_new_row_group(&mut self) -> anyhow::Result<(), Box<dyn std::error::Error>> {
+        let row_group_writer = self.writer.next_row_group()?;
+        self.current_row_group = Some(unsafe { std::mem::transmute(row_group_writer) });
+        self.rows_in_current_group = 0;
+        Ok(())
+    }
+
+    fn finish_current_row_group(&mut self) -> anyhow::Result<(), Box<dyn std::error::Error>> {
+        if let Some(row_group_writer) = self.current_row_group.take() {
+            let row_group_writer: SerializedRowGroupWriter<File> = unsafe { std::mem::transmute(row_group_writer) };
+            row_group_writer.close()?;
+        }
+        Ok(())
+    }
+
+    pub fn close(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.finish_current_row_group()?;
         self.writer.close()?;
         Ok(())
     }
@@ -122,8 +160,8 @@ impl SyncParquetReader {
         Ok(parquet_reader)
     }
 
-    pub fn read(&self) -> anyhow::Result<Vec<Entry>, Box<dyn std::error::Error>> {
-        let mut entries: Vec<Entry> = Vec::new();
+    pub fn read(&self) -> anyhow::Result<Vec<Record>, Box<dyn std::error::Error>> {
+        let mut entries: Vec<Record> = Vec::new();
 
         let row_iter = self.reader.get_row_iter(Some(self.schema.clone()));
         for row_result in row_iter? {
@@ -164,7 +202,7 @@ impl SyncParquetReader {
                     Vec::new()
                 };
 
-                let message: Entry = Entry {
+                let message: Record = Record {
                     timestamp_info,
                     data: bytes,
                 };
@@ -209,9 +247,9 @@ impl AsyncParquetReader {
         })
     }
 
-    pub async fn read(self) -> anyhow::Result<Vec<Entry>, Box<dyn std::error::Error>> {
+    pub async fn read(self) -> anyhow::Result<Vec<Record>, Box<dyn std::error::Error>> {
         let results = self.stream.try_collect::<Vec<_>>().await?;
-        let mut entries: Vec<Entry> = Vec::new();
+        let mut entries: Vec<Record> = Vec::new();
 
         for batch in results {
             let num_rows = batch.num_rows();
@@ -228,18 +266,18 @@ impl AsyncParquetReader {
                     timestamp_sub_sec: timestamp_sub_sec_array.value(i),
                 };
                 let data = data_array.value(i).to_vec();
-                let entry = Entry {
+                let record = Record {
                     timestamp_info,
                     data,
                 };
-                entries.push(entry);
+                entries.push(record);
             }
         }
 
         Ok(entries)
     }
 
-    pub fn into_entry_stream(self) -> impl futures::Stream<Item = anyhow::Result<Entry, Box<dyn std::error::Error + Send + Sync>>> {
+    pub fn into_record_stream(self) -> impl futures::Stream<Item = anyhow::Result<Record, Box<dyn std::error::Error + Send + Sync>>> {
         self.stream.map(move |batch_result| {
             match batch_result {
                 Ok(batch) => {
@@ -257,11 +295,11 @@ impl AsyncParquetReader {
                             timestamp_sub_sec: timestamp_sub_sec_array.value(i),
                         };
                         let data = data_array.value(i).to_vec();
-                        let entry = Entry {
+                        let record = Record {
                             timestamp_info,
                             data,
                         };
-                        results.push(Ok(entry));
+                        results.push(Ok(record));
                     }
 
                     futures::stream::iter(results)
@@ -307,25 +345,26 @@ mod tests {
 
     #[test]
     fn test_sync_parquet_operations() {
+        let test_max_rows_per_group = 1;
         let test_file_path = "target/test.parquet";
         let test_timestamp_info = get_timestamp_info().unwrap();
         let test_string: String = String::from("Hello, Parquet!");
-        let test_entry = Entry {
+        let test_record = Record {
             timestamp_info: test_timestamp_info.clone(),
             data: test_string.clone().as_bytes().to_vec(),
         };
-        let test_entries: Vec<Entry> = vec![test_entry.clone()];
+        let test_entries: Vec<Record> = vec![test_record.clone()];
 
         // Write the test data first
-        let mut parquet_writer = ParquetWriter::new(test_file_path).unwrap();
+        let mut parquet_writer = ParquetWriter::new(test_file_path, test_max_rows_per_group).unwrap();
         parquet_writer
-            .write(&test_entry)
+            .write(&test_record)
             .unwrap();
         parquet_writer.close().unwrap();
 
         // Test sync reading
         let parquet_reader = SyncParquetReader::new(test_file_path).unwrap();
-        let read_entries: Vec<Entry> = parquet_reader.read().unwrap();
+        let read_entries: Vec<Record> = parquet_reader.read().unwrap();
 
         assert_eq!(test_entries, read_entries);
         assert_eq!(
@@ -342,23 +381,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_async_parquet_operations() {
+        let test_max_rows_per_group = 1;
         let test_file_path = "target/test_async.parquet";
         let test_timestamp_info = get_timestamp_info().unwrap();
         let test_string: String = String::from("Hello, Async Parquet!");
-        let test_entry = Entry {
+        let test_record = Record {
             timestamp_info: test_timestamp_info.clone(),
             data: test_string.clone().as_bytes().to_vec(),
         };
-        let test_entries: Vec<Entry> = vec![test_entry.clone()];
+        let test_entries: Vec<Record> = vec![test_record.clone()];
 
         // Write the test data first
-        let mut parquet_writer = ParquetWriter::new(test_file_path).unwrap();
-        parquet_writer.write(&test_entry).unwrap();
+        let mut parquet_writer = ParquetWriter::new(test_file_path, test_max_rows_per_group).unwrap();
+        parquet_writer.write(&test_record).unwrap();
         parquet_writer.close().unwrap();
 
         // Test async reading
         let parquet_reader = AsyncParquetReader::new(test_file_path, 1024).await.unwrap();
-        let read_entries: Vec<Entry> = parquet_reader.read().await.unwrap();
+        let read_entries: Vec<Record> = parquet_reader.read().await.unwrap();
 
         assert_eq!(test_entries, read_entries);
         assert_eq!(
@@ -373,27 +413,28 @@ mod tests {
 
     #[tokio::test]
     async fn test_async_stream_operations() {
+        let test_max_rows_per_group = 1;
         let test_file_path = "target/test_stream.parquet";
         let test_timestamp_info = get_timestamp_info().unwrap();
         let test_string: String = String::from("Hello, Stream Parquet!");
-        let test_entry = Entry {
+        let test_record = Record {
             timestamp_info: test_timestamp_info.clone(),
             data: test_string.clone().as_bytes().to_vec(),
         };
 
         // Write the test data first
-        let mut parquet_writer = ParquetWriter::new(test_file_path).unwrap();
-        parquet_writer.write(&test_entry).unwrap();
+        let mut parquet_writer = ParquetWriter::new(test_file_path, test_max_rows_per_group).unwrap();
+        parquet_writer.write(&test_record).unwrap();
         parquet_writer.close().unwrap();
 
         // Test async streaming
         let async_reader = AsyncParquetReader::new(test_file_path, 1024).await.unwrap();
-        let mut stream = async_reader.into_entry_stream();
+        let mut stream = async_reader.into_record_stream();
 
         let mut entries = Vec::new();
         while let Some(result) = stream.next().await {
             match result {
-                Ok(entry) => entries.push(entry),
+                Ok(record) => entries.push(record),
                 Err(e) => panic!("Stream error: {}", e),
             }
         }
@@ -405,41 +446,42 @@ mod tests {
 
     #[tokio::test]
     async fn test_async_stream_multiple_entries() {
+        let test_max_rows_per_group = 1;
         let test_file_path = "target/test_stream_multiple.parquet";
         let test_entries = vec![
-            Entry {
+            Record {
                 timestamp_info: get_timestamp_info().unwrap(),
-                data: "Entry 1".as_bytes().to_vec(),
+                data: "Record 1".as_bytes().to_vec(),
             },
-            Entry {
+            Record {
                 timestamp_info: get_timestamp_info().unwrap(),
-                data: "Entry 2".as_bytes().to_vec(),
+                data: "Record 2".as_bytes().to_vec(),
             },
-            Entry {
+            Record {
                 timestamp_info: get_timestamp_info().unwrap(),
-                data: "Entry 3".as_bytes().to_vec(),
+                data: "Record 3".as_bytes().to_vec(),
             },
         ];
 
         // Write multiple entries
-        let mut parquet_writer = ParquetWriter::new(test_file_path).unwrap();
-        for entry in &test_entries {
-            parquet_writer.write(entry).unwrap();
+        let mut parquet_writer = ParquetWriter::new(test_file_path, test_max_rows_per_group).unwrap();
+        for record in &test_entries {
+            parquet_writer.write(record).unwrap();
         }
         parquet_writer.close().unwrap();
 
         // Test streaming multiple entries
         let async_reader = AsyncParquetReader::new(test_file_path, 1024).await.unwrap();
-        let stream = async_reader.into_entry_stream();
+        let stream = async_reader.into_record_stream();
 
-        let streamed_entries: Vec<Entry> = stream
+        let streamed_entries: Vec<Record> = stream
             .map(|result| result.unwrap())
             .collect()
             .await;
 
         assert_eq!(streamed_entries.len(), test_entries.len());
-        for (i, entry) in streamed_entries.iter().enumerate() {
-            assert_eq!(entry.data, test_entries[i].data);
+        for (i, record) in streamed_entries.iter().enumerate() {
+            assert_eq!(record.data, test_entries[i].data);
         }
     }
 }
