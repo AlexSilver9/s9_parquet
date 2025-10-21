@@ -41,7 +41,7 @@ pub struct Record {
 pub struct ParquetWriter {
     pub writer: SerializedFileWriter<File>,
     pub file_path: PathBuf,
-    max_records_per_group: usize,
+    pub max_records_per_group: usize,
 }
 
 // TOOD: Handle max limits like this:
