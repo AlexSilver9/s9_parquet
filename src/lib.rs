@@ -49,6 +49,9 @@ pub struct ParquetWriter {
 
 impl ParquetWriter {
     pub fn new<P: AsRef<Path>>(path: P, max_records_per_group: usize) -> anyhow::Result<Self, Box<dyn std::error::Error>> {
+        if max_records_per_group < 1 {
+            return Err("Max records per group must be greater than 0".into());
+        }
         let path_buf = PathBuf::from(path.as_ref());
         let schema = Arc::new(parse_message_type(MESSAGE_SCHEMA)?);
         let file = File::create(path_buf.as_path())?;
